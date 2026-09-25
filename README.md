@@ -189,12 +189,22 @@ stegoforge encode -c music.wav -p logo.png --method spectrogram
 # Decoy mode — Generates two keys, hiding two payloads in one file for plausible deniability
 stegoforge encode -c photo.png -p real_secret.txt -k "realkey" \
                   --decoy decoy_message.txt --decoy-key "duresskey"
+
+# Multi-carrier fragmentation — split a large payload across several carriers.
+# Capacity is planned (33-byte fragment header + CRC32 per carrier) before any
+# carrier is touched; over-capacity jobs fail up front with no partial files.
+stegoforge encode -c photo1.png -c photo2.png -c photo3.png -p bigfile.bin -k "key"
 ```
 
 ### 🔓 2. Payload Decoding
 ```bash
 stegoforge decode -f photo_stego.png -k "passphrase"
 stegoforge decode -f music_stego.wav -k "key" --method phase
+
+# Reassemble a fragmented payload (order of -f arguments does not matter;
+# missing, duplicate, truncated, or corrupted fragments fail with clear errors)
+stegoforge decode -f photo1_stego_part1of3.png -f photo2_stego_part2of3.png \
+                  -f photo3_stego_part3of3.png -k "key"
 ```
 
 ### 🕵️ 3. Blind Forensics & CTF Mode (Zero-Knowledge)

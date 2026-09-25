@@ -19,7 +19,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from core import sysmgr
 from core.version import __version__ as APP_VERSION
@@ -806,7 +806,7 @@ def _resize_carrier_if_needed(carrier_bytes: bytes, ext: str, max_dim: int) -> t
 # ── Core operation helpers ────────────────────────────────────────────────────
 
 def op_encode(
-    carrier: str,
+    carrier: "str | List[str]",
     payload: str,
     key: str | None,
     output: str | None,
@@ -829,6 +829,32 @@ def op_encode(
     channel: str | None = None,
     timing_delta: int = 50,
 ) -> dict:
+    carrier_paths = [carrier] if isinstance(carrier, str) else list(carrier)
+    if len(carrier_paths) > 1:
+        unsupported = []
+        if decoy or decoy_key:
+            unsupported.append("--decoy/--decoy-key")
+        if wet_paper:
+            unsupported.append("--wet-paper")
+        if target:
+            unsupported.append("--target")
+        if test_survival:
+            unsupported.append("--test-survival")
+        if preserve_fingerprint:
+            unsupported.append("--preserve-fingerprint")
+        if cover or topic or llm_model:
+            unsupported.append("--cover/--topic/--llm-model (linguistic)")
+        if target_ip or listen_ip:
+            unsupported.append("network covert options")
+        if unsupported:
+            raise ValueError(
+                "Multi-carrier fragmentation does not support: "
+                + ", ".join(unsupported)
+            )
+        return _op_encode_multi(
+            carrier_paths, payload, key, output, method, depth, json_mode
+        )
+    carrier = carrier_paths[0]
     carrier_path = Path(cover) if cover else Path(carrier)
     payload_path = Path(payload)
 
@@ -932,6 +958,8 @@ def op_encode(
             suggestions.append("--method adaptive-lsb (higher effective capacity + better stealth)")
         budget_needed = len(embed_bytes) - cap
         suggestions.append(f"use a larger carrier (need at least {budget_needed:,} more bytes of capacity)")
+        suggestions.append("split across multiple carriers: repeat -c/--carrier per carrier "
+                           "(fragmentation adds 33 bytes of header+CRC32 overhead per carrier)")
         raw_payload_size = len(payload_bytes)
         if len(embed_bytes) > 0:
             overhead_ratio = len(embed_bytes) / raw_payload_size if raw_payload_size else 1
@@ -1010,6 +1038,99 @@ def op_encode(
     return result
 
 
+def _op_encode_multi(
+    carriers: List[str],
+    payload: str,
+    key: str | None,
+    output: str | None,
+    method: str | None,
+    depth: int,
+    json_mode: bool,
+) -> dict:
+    """Embed a payload fragmented across multiple carriers.
+
+    Capacity planning (including the 33-byte fragment header + CRC32 per
+    carrier) happens entirely before any carrier is encoded or any output
+    file is written, so an over-capacity job never leaves partial files.
+    """
+    from core import fragment as frag_mod
+    from core.crypto import aes
+
+    payload_path = Path(payload)
+    if not payload_path.exists():
+        raise IOError(f"Payload file not found: {payload}")
+    carrier_paths = [Path(c) for c in carriers]
+    for cp in carrier_paths:
+        if not cp.exists():
+            raise IOError(f"Carrier file not found: {cp}")
+
+    payload_bytes = payload_path.read_bytes()
+    key = key or os.getenv("STEGOFORGE_KEY", "")
+    embed_bytes = aes.encrypt(payload_bytes, key) if key else payload_bytes
+
+    # ── Preflight: resolve method and capacity for every carrier ──────────
+    per_carrier = []
+    for cp in carrier_paths:
+        ext = cp.suffix.lower()
+        m = method or auto_detect_method(str(cp))
+        if m in ("linguistic", "tcp-covert", "timing-covert"):
+            raise ValueError(f"Method '{m}' does not support multi-carrier fragmentation")
+        encoder = get_encoder(m)
+        kwargs = {"depth": depth, "key": key}
+        if m in ("audio-lsb", "phase", "spectrogram", "video-dct", "video-motion"):
+            kwargs["ext"] = ext
+        if m in ("docx", "xlsx", "office"):
+            kwargs["filename"] = str(cp)
+        carrier_bytes = cp.read_bytes()
+        cap_kwargs = {k: v for k, v in kwargs.items() if k != "key"}
+        cap = encoder.capacity(carrier_bytes, **cap_kwargs)
+        per_carrier.append({
+            "path": cp, "method": m, "encoder": encoder,
+            "kwargs": kwargs, "bytes": carrier_bytes, "capacity": cap,
+        })
+
+    capacities = [c["capacity"] for c in per_carrier]
+    # Raises CapacityError here — before a single carrier is touched.
+    fragments = frag_mod.split_payload(embed_bytes, capacities)
+    used = [(c, f) for c, f in zip(per_carrier, fragments) if f is not None]
+
+    # ── Encode every fragment in memory; write files only after all succeed ─
+    staged = []
+    for c, frag in used:
+        stego_bytes = c["encoder"].encode(c["bytes"], frag, **c["kwargs"])
+        staged.append((c["path"], c["method"], stego_bytes))
+
+    out_dir = Path(output) if output else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    n = len(staged)
+    outputs = []
+    for i, (cp, m, stego_bytes) in enumerate(staged, 1):
+        name = f"{cp.stem}_stego_part{i}of{n}{cp.suffix}"
+        out_path = (out_dir / name) if out_dir else cp.with_name(name)
+        out_path.write_bytes(stego_bytes)
+        outputs.append(out_path)
+
+    methods_used = sorted({m for _, m, _ in staged})
+    return {
+        "status": "success",
+        "method": "+".join(methods_used),
+        "fragmented": True,
+        "fragments": n,
+        "carriers": [str(c["path"]) for c in per_carrier],
+        "outputs": [str(p) for p in outputs],
+        "payload_size": len(payload_bytes),
+        "encrypted_size": len(embed_bytes),
+        "capacity": sum(capacities),
+        "usable_capacity": sum(frag_mod.usable_capacity(c) for c in capacities),
+        "fragment_overhead_bytes": frag_mod.HEADER_SIZE,
+        "depth": depth,
+        "decoy_mode": False,
+        "wet_paper": False,
+        "preserve_fingerprint": False,
+    }
+
+
 def _guess_payload_ext(data: bytes) -> str:
     if len(data) >= 12 and data[4:8] == b"ftyp": return ".mp4"
     if data[:4] == b"PK\x03\x04": return ".zip"
@@ -1032,7 +1153,7 @@ def _guess_payload_ext(data: bytes) -> str:
 
 
 def op_decode(
-    file: str,
+    file: "str | List[str]",
     key: str | None,
     output: str | None,
     method: str | None,
@@ -1045,6 +1166,12 @@ def op_decode(
     channel: str | None = None,
     timing_delta: int = 50,
 ) -> dict:
+    files = [file] if isinstance(file, str) else list(file)
+    if len(files) > 1:
+        if wet_paper:
+            raise ValueError("Multi-carrier decode does not support --wet-paper")
+        return _op_decode_multi(files, key, output, method, json_mode)
+    file = files[0]
     file_path = Path(file)
     if not file_path.exists():
         raise IOError(f"File not found: {file}")
@@ -1182,6 +1309,105 @@ def op_decode(
         "wet_corrected_bits": int(locals().get("wet_corrected_bits", 0)),
     }
     return result
+
+
+def _op_decode_multi(
+    files: List[str],
+    key: str | None,
+    output: str | None,
+    method: str | None,
+    json_mode: bool,
+) -> dict:
+    """Extract fragments from multiple stego carriers and reassemble in order."""
+    from core import fragment as frag_mod
+    from core.crypto import aes, decoy as decoy_mod
+
+    key = key or os.getenv("STEGOFORGE_KEY", "")
+    depth_methods = {"lsb", "adaptive-lsb", "fingerprint-lsb", "audio-lsb"}
+
+    raw_fragments = []
+    methods_used = set()
+    for f in files:
+        file_path = Path(f)
+        if not file_path.exists():
+            raise IOError(f"File not found: {f}")
+        stego_bytes = file_path.read_bytes()
+        ext = file_path.suffix.lower()
+
+        if method:
+            methods_to_try = [method]
+        else:
+            suggested = auto_detect_method(f)
+            if suggested in ("audio-lsb", "phase", "spectrogram"):
+                methods_to_try = ["audio-lsb", "phase", "spectrogram"]
+            elif suggested in ("video-dct", "video-motion"):
+                methods_to_try = ["video-dct", "video-motion"]
+            elif suggested in ("lsb", "adaptive-lsb", "dct", "alpha", "palette", "fingerprint-lsb"):
+                methods_to_try = ["adaptive-lsb", "lsb", "fingerprint-lsb", "dct", "alpha", "palette"]
+            elif suggested in ("elf", "pe"):
+                methods_to_try = ["elf", "pe"]
+            else:
+                methods_to_try = [suggested]
+
+        raw = None
+        last_error = None
+        for try_method in methods_to_try:
+            encoder = get_encoder(try_method)
+            kwargs = {"key": key}
+            if try_method in ("audio-lsb", "phase", "spectrogram", "video-dct", "video-motion"):
+                kwargs["ext"] = ext
+            if try_method in ("docx", "xlsx", "office"):
+                kwargs["filename"] = str(file_path)
+            depths = [1, 2, 3, 4] if try_method in depth_methods else [1]
+            for d in depths:
+                try:
+                    candidate = encoder.decode(stego_bytes, depth=d, **kwargs)
+                except ValueError as e:
+                    last_error = str(e)
+                    continue
+                if frag_mod.is_fragment(candidate):
+                    raw = candidate
+                    methods_used.add(try_method)
+                    break
+            if raw is not None:
+                break
+        if raw is None:
+            raise ValueError(
+                f"{f}: no valid fragment found — not a fragmented stego "
+                f"carrier, or wrong method/key. Last error: {last_error}"
+            )
+        raw_fragments.append(raw)
+
+    # Raises FragmentError with a specific message for missing, duplicate,
+    # mixed-session, truncated, or corrupted fragments.
+    joined = frag_mod.join_fragments(raw_fragments)
+
+    if not key:
+        payload = joined
+    else:
+        try:
+            payload = decoy_mod.decode_dual(joined, key)
+        except ValueError:
+            payload = aes.decrypt(joined, key)
+
+    if output:
+        out_path = Path(output)
+    else:
+        stem = re.sub(r"_stego(_part\d+of\d+)?$", "", Path(files[0]).stem)
+        out_path = Path(files[0]).with_name(f"{stem}_decoded{_guess_payload_ext(payload)}")
+    out_path.write_bytes(payload)
+
+    return {
+        "status": "success",
+        "method": "+".join(sorted(methods_used)),
+        "fragmented": True,
+        "fragments": len(raw_fragments),
+        "files": [str(f) for f in files],
+        "payload_size": len(payload),
+        "output": str(out_path),
+        "wet_paper": False,
+        "wet_corrected_bits": 0,
+    }
 
 
 def op_detect(
@@ -1428,12 +1654,15 @@ def op_capacity(carrier: str, method: str | None, depth: int) -> dict:
 
     cap = encoder.capacity(carrier_bytes, **kwargs)
 
+    from core import fragment as frag_mod
     result = {
         "status": "success",
         "carrier": str(carrier_path),
         "method": method,
         "depth": depth,
         "capacity_bytes": cap,
+        "fragment_overhead_bytes": frag_mod.HEADER_SIZE,
+        "max_fragmented_payload_bytes": frag_mod.usable_capacity(cap),
         "capacity_kb": round(cap / 1024, 2),
         "capacity_mb": round(cap / (1024 * 1024), 4),
         "stealth_score": STEALTH_SCORES.get(method, 0),
@@ -1728,6 +1957,22 @@ def _result_to_dict(result) -> dict:
 # ── Rich output helpers ───────────────────────────────────────────────────────
 
 def print_encode_result(result: dict):
+    if result.get("fragmented"):
+        outputs = "\n".join(f"    [{C_SUCCESS}]→[/{C_SUCCESS}] {o}" for o in result["outputs"])
+        panel_content = (
+            f"[{C_SUCCESS}]✓ Payload fragmented and embedded across {result['fragments']} carriers[/{C_SUCCESS}]\n\n"
+            f"  [dim]Method    :[/dim]  [{C_ACCENT}]{result['method'].upper()}[/{C_ACCENT}]\n"
+            f"  [dim]Payload   :[/dim]  {result['payload_size']:,} bytes → "
+            f"{result['encrypted_size']:,} bytes encrypted\n"
+            f"  [dim]Fragments :[/dim]  {result['fragments']} "
+            f"({result['fragment_overhead_bytes']} bytes header+CRC32 each)\n"
+            f"  [dim]Capacity  :[/dim]  {result['usable_capacity']:,} of {result['capacity']:,} bytes usable\n"
+            f"  [dim]Depth     :[/dim]  {result['depth']} bit(s)\n"
+            f"  [dim]Outputs   :[/dim]\n{outputs}"
+        )
+        console.print(Panel(panel_content, title=f"[{C_TITLE}]StegoForge — Encode Result[/{C_TITLE}]",
+                            border_style="cyan", padding=(1, 2)))
+        return
     extra_lines = []
     if result.get("wet_paper"):
         extra_lines.append("  [dim]Wet Paper :[/dim]  Enabled (Reed-Solomon redundancy active)")
@@ -1764,6 +2009,17 @@ def print_encode_result(result: dict):
 
 
 def print_decode_result(result: dict):
+    if result.get("fragmented"):
+        panel_content = (
+            f"[{C_SUCCESS}]✓ {result['fragments']} fragments reassembled, payload extracted[/{C_SUCCESS}]\n\n"
+            f"  [dim]Method    :[/dim]  [{C_ACCENT}]{result['method'].upper()}[/{C_ACCENT}]\n"
+            f"  [dim]Inputs    :[/dim]  {len(result['files'])} stego carriers\n"
+            f"  [dim]Output    :[/dim]  [{C_SUCCESS}]{result['output']}[/{C_SUCCESS}]\n"
+            f"  [dim]Payload   :[/dim]  {result['payload_size']:,} bytes"
+        )
+        console.print(Panel(panel_content, title=f"[{C_TITLE}]StegoForge — Decode Result[/{C_TITLE}]",
+                            border_style="green", padding=(1, 2)))
+        return
     wet_line = ""
     if result.get("wet_paper"):
         wet_line = f"\n  [dim]Wet Paper :[/dim]  Enabled (corrected bits: {result.get('wet_corrected_bits', 0)})"
@@ -1830,6 +2086,11 @@ def print_capacity_result(result: dict):
         f"    [{C_GOLD}]{result['capacity_bytes']:>12,}[/{C_GOLD}] bytes\n"
         f"    [{C_GOLD}]{result['capacity_kb']:>12.2f}[/{C_GOLD}] KB\n"
         f"    [{C_GOLD}]{result['capacity_mb']:>12.4f}[/{C_GOLD}] MB"
+    )
+    panel_content += (
+        f"\n\n  [dim]Fragmented payloads: up to "
+        f"{result['max_fragmented_payload_bytes']:,} bytes/carrier "
+        f"({result['fragment_overhead_bytes']} bytes header+CRC32 overhead)[/dim]"
     )
     if result.get("jnd_safe_dct_capacity"):
         j = result["jnd_safe_dct_capacity"]
@@ -2427,7 +2688,7 @@ def cmd_update(
 
 @app.command("encode", help="Embed a payload into a carrier file")
 def cmd_encode(
-    carrier:   str  = typer.Option(..., "-c", "--carrier",   help="Path to carrier file"),
+    carrier:   List[str] = typer.Option(..., "-c", "--carrier", help="Path to carrier file (repeat for multi-carrier fragmentation)"),
     payload:   str  = typer.Option(..., "-p", "--payload",   help="Path to payload file"),
     key:       Optional[str] = typer.Option(None, "-k", "--key", help="Encryption passphrase (optional)"),
     output:    Optional[str] = typer.Option(None, "-o", "--output",  help="Output path (auto if omitted)"),
@@ -2493,7 +2754,7 @@ def cmd_encode(
 
 @app.command("decode", help="Extract and decrypt a hidden payload")
 def cmd_decode(
-    file:      str  = typer.Option(..., "-f", "--file",   help="Path to stego file"),
+    file:      List[str] = typer.Option(..., "-f", "--file",   help="Path to stego file (repeat for fragmented payloads)"),
     key:       Optional[str] = typer.Option(None, "-k", "--key", help="Decryption passphrase (optional)"),
     output:    Optional[str] = typer.Option(None, "-o", "--output", help="Output path (auto if omitted)"),
     method:    Optional[str] = typer.Option(None,       "--method", help="Encoding method (auto-detected if omitted)"),
