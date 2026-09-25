@@ -191,6 +191,22 @@ stegoforge encode -c photo.png -p real_secret.txt -k "realkey" \
                   --decoy decoy_message.txt --decoy-key "duresskey"
 ```
 
+### 📦 1b. Multi-Carrier Chunked Encoding (Large Payloads)
+```bash
+# Split a large payload across several carriers — capacity of every carrier is
+# measured up front; if it does not fit, nothing is written.
+stegoforge encode-multi -c a.png -c b.png -c c.png -p big_archive.zip -k "pass"
+
+# Reassemble in any argument order — chunk order is embedded in each frame.
+# Missing, duplicated, or truncated parts fail with an explicit error.
+stegoforge decode-multi -f b_stego_part002of003.png \
+                        -f a_stego_part001of003.png \
+                        -f c_stego_part003of003.png -k "pass"
+
+# Per-carrier usable capacity (frame header + CRC32 already deducted)
+stegoforge capacity -c photo.png
+```
+
 ### 🔓 2. Payload Decoding
 ```bash
 stegoforge decode -f photo_stego.png -k "passphrase"

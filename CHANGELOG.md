@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+### 🚀 New Features
+- **Multi-Carrier Chunked Embedding**: New `encode-multi` / `decode-multi` commands split oversized payloads across multiple carriers via checksummed frames (`core/framing.py`: magic, session id, chunk index/total, length, CRC32). Chunks reassemble in embedded order regardless of file argument order.
+- **Reliable Capacity Estimation**: `capacity` command now reports the usable payload per carrier with the 25-byte frame header + CRC32 overhead already deducted, alongside the raw encoder capacity.
+
+### 🛡️ Safety & Error Handling
+- **Pre-Flight Capacity Check**: `encode-multi` measures every carrier before writing anything — over-capacity payloads fail with a `CapacityError` before any carrier is touched, eliminating half-written output sets.
+- **Explicit Restore Errors**: decoding distinguishes missing chunks (`MissingChunkError`), duplicate chunks, mixed encode sessions (`SessionMismatchError`), truncated frames (`FrameTruncatedError`), and corrupted data (`FrameChecksumError`).
+
+---
+
 ## [1.1.5] — 2026-04-26
 
 ### 🛠️ Bug Fixes & Improvements

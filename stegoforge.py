@@ -1184,6 +1184,210 @@ def op_decode(
     return result
 
 
+def _carrier_kwargs(method: str, path: Path, depth: int, key: str | None) -> dict:
+    """Build encode/decode kwargs for a carrier-bound method."""
+    kwargs: dict = {"depth": depth, "key": key}
+    ext = path.suffix.lower()
+    if method in ("audio-lsb", "phase", "spectrogram", "video-dct", "video-motion"):
+        kwargs["ext"] = ext
+    if method in ("docx", "xlsx", "office"):
+        kwargs["filename"] = str(path)
+    return kwargs
+
+
+def op_encode_multi(
+    carriers: list[str],
+    payload: str,
+    key: str | None,
+    output_dir: str | None,
+    method: str | None,
+    depth: int,
+    json_mode: bool,
+) -> dict:
+    """
+    Split a (possibly large) payload across multiple carriers.
+
+    Every carrier is measured up front; if the payload does not fit, a
+    CapacityError is raised BEFORE any carrier is modified or any output
+    file is written. Each chunk is wrapped in a checksummed frame
+    (core/framing.py) so decode-multi can reassemble in order and detect
+    missing/truncated chunks.
+    """
+    from core import framing
+    from core.crypto import aes
+
+    payload_path = Path(payload)
+    if not payload_path.exists():
+        raise IOError(f"Payload file not found: {payload}")
+    if not carriers:
+        raise ValueError("At least one carrier is required (repeat -c/--carrier)")
+
+    carrier_paths = [Path(c) for c in carriers]
+    for cp in carrier_paths:
+        if not cp.exists():
+            raise IOError(f"Carrier file not found: {cp}")
+
+    payload_bytes = payload_path.read_bytes()
+    key = key or os.getenv("STEGOFORGE_KEY", "")
+    embed_bytes = aes.encrypt(payload_bytes, key) if key else payload_bytes
+
+    # ── Pre-flight: measure every carrier BEFORE touching any of them ──
+    plans = []
+    for cp in carrier_paths:
+        m = method or auto_detect_method(str(cp))
+        encoder = get_encoder(m)
+        carrier_bytes = cp.read_bytes()
+        cap_kwargs = _carrier_kwargs(m, cp, depth, None)
+        cap_kwargs.pop("key", None)
+        raw_cap = encoder.capacity(carrier_bytes, **cap_kwargs)
+        plans.append({
+            "path": cp,
+            "method": m,
+            "encoder": encoder,
+            "carrier_bytes": carrier_bytes,
+            "raw_capacity": raw_cap,
+            "usable": framing.usable_capacity(raw_cap),
+        })
+
+    capacities = [p["usable"] for p in plans]
+    # Raises framing.CapacityError here — before a single byte is written.
+    chunks = framing.split_payload(embed_bytes, capacities)
+    session_id = framing.new_session_id()
+    total = len(chunks)
+    frames = [
+        framing.pack_frame(session_id, i, total, chunk)
+        for i, chunk in enumerate(chunks)
+    ]
+
+    out_dir = Path(output_dir) if output_dir else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    width = max(3, len(str(total)))
+    outputs = []
+    for i, (plan, frame) in enumerate(zip(plans, frames)):
+        if len(frame) > plan["raw_capacity"]:
+            # Defensive: usable = raw - FRAME_HEADER_SIZE should prevent this.
+            raise framing.CapacityError(
+                f"Framed chunk ({len(frame):,} B) exceeds raw capacity of "
+                f"{plan['path'].name} ({plan['raw_capacity']:,} B) — aborting, "
+                f"no further carriers written"
+            )
+        kwargs = _carrier_kwargs(plan["method"], plan["path"], depth, key)
+        stego_bytes = plan["encoder"].encode(plan["carrier_bytes"], frame, **kwargs)
+        part_name = (
+            f"{plan['path'].stem}_stego"
+            f"_part{str(i + 1).zfill(width)}of{str(total).zfill(width)}"
+            f"{plan['path'].suffix}"
+        )
+        out_path = (out_dir / part_name) if out_dir else plan["path"].with_name(part_name)
+        out_path.write_bytes(stego_bytes)
+        outputs.append({
+            "carrier": str(plan["path"]),
+            "output": str(out_path),
+            "method": plan["method"],
+            "chunk_index": i,
+            "chunk_bytes": len(chunks[i]),
+            "frame_bytes": len(frame),
+            "capacity": plan["raw_capacity"],
+        })
+
+    return {
+        "status": "success",
+        "payload": str(payload_path),
+        "payload_size": len(payload_bytes),
+        "embedded_size": len(embed_bytes),
+        "encrypted": bool(key),
+        "chunks": total,
+        "session_id": session_id.hex(),
+        "frame_overhead_per_carrier": framing.FRAME_HEADER_SIZE,
+        "depth": depth,
+        "outputs": outputs,
+    }
+
+
+def op_decode_multi(
+    files: list[str],
+    key: str | None,
+    output: str | None,
+    method: str | None,
+    json_mode: bool,
+) -> dict:
+    """
+    Reassemble a payload split across multiple stego carriers by encode-multi.
+
+    Frames carry their own index, so input file order does not matter.
+    Missing chunks, duplicates, session mismatches and truncated/corrupted
+    frames each raise a distinct, explicit error.
+    """
+    from core import framing
+    from core.crypto import aes
+
+    if not files:
+        raise ValueError("At least one stego file is required (repeat -f/--file)")
+
+    key = key or os.getenv("STEGOFORGE_KEY", "")
+
+    frames = []
+    for f in files:
+        fp = Path(f)
+        if not fp.exists():
+            raise IOError(f"Stego file not found: {f}")
+        stego_bytes = fp.read_bytes()
+        m = method or auto_detect_method(str(fp))
+        encoder = get_encoder(m)
+
+        raw = None
+        last_err: Exception | None = None
+        depth_methods = {"lsb", "adaptive-lsb", "fingerprint-lsb", "audio-lsb"}
+        depths = [1, 2, 3, 4] if m in depth_methods else [1]
+        for d in depths:
+            kwargs = _carrier_kwargs(m, fp, d, key)
+            try:
+                candidate = encoder.decode(stego_bytes, **kwargs)
+            except (ValueError, OSError) as e:
+                # OSError: carrier file itself is truncated/unreadable (e.g. PIL)
+                last_err = e
+                continue
+            if framing.is_frame(candidate):
+                raw = candidate
+                break
+            last_err = ValueError("extracted data is not a chunk frame")
+        if raw is None:
+            raise ValueError(
+                f"{fp.name}: no chunk frame found — wrong method/depth/key, "
+                f"or file was not produced by encode-multi. Last error: {last_err}"
+            )
+        try:
+            frames.append(framing.unpack_frame(raw))
+        except framing.FrameError as e:
+            raise type(e)(f"{fp.name}: {e}") from e
+
+    # Raises MissingChunkError / DuplicateChunkError / SessionMismatchError.
+    embed_bytes = framing.reassemble(frames)
+
+    if key:
+        payload = aes.decrypt(embed_bytes, key)
+    else:
+        payload = embed_bytes
+
+    if output:
+        out_path = Path(output)
+    else:
+        stem = re.sub(r"_stego(_part\d+of\d+)?$", "", Path(files[0]).stem)
+        detected_ext = _guess_payload_ext(payload)
+        out_path = Path(files[0]).with_name(f"{stem}_decoded{detected_ext}")
+    out_path.write_bytes(payload)
+
+    return {
+        "status": "success",
+        "chunks": len(frames),
+        "session_id": frames[0].session_id.hex(),
+        "payload_size": len(payload),
+        "output": str(out_path),
+    }
+
+
 def op_detect(
     file: str,
     chi2: bool,
@@ -1437,6 +1641,19 @@ def op_capacity(carrier: str, method: str | None, depth: int) -> dict:
         "capacity_kb": round(cap / 1024, 2),
         "capacity_mb": round(cap / (1024 * 1024), 4),
         "stealth_score": STEALTH_SCORES.get(method, 0),
+    }
+
+    # Reliable estimate for chunked (encode-multi) embedding: the raw capacity
+    # above already excludes the encoder's own length header; the usable figure
+    # additionally subtracts the per-carrier frame header + CRC32 overhead.
+    from core import framing
+    usable = framing.usable_capacity(cap)
+    result["chunked_payload_estimate"] = {
+        "usable_bytes": usable,
+        "usable_kb": round(usable / 1024, 2),
+        "frame_overhead_bytes": framing.FRAME_HEADER_SIZE,
+        "note": "Max payload per carrier when embedding via encode-multi "
+                "(frame header + CRC32 checksum already deducted)",
     }
 
     if method == "dct":
@@ -1780,6 +1997,37 @@ def print_decode_result(result: dict):
                         border_style="green", padding=(1, 2)))
 
 
+def print_encode_multi_result(result: dict):
+    lines = [
+        f"[{C_SUCCESS}]✓ Payload split into {result['chunks']} chunk(s) and embedded[/{C_SUCCESS}]",
+        "",
+        f"  [dim]Payload   :[/dim]  {result['payload_size']:,} bytes → {result['embedded_size']:,} bytes embedded"
+        f"{' (encrypted)' if result['encrypted'] else ''}",
+        f"  [dim]Session   :[/dim]  {result['session_id']}",
+        f"  [dim]Overhead  :[/dim]  {result['frame_overhead_per_carrier']} bytes frame header + CRC32 per carrier",
+        "",
+        "  [dim]Chunks:[/dim]",
+    ]
+    for o in result["outputs"]:
+        lines.append(
+            f"    [{C_ACCENT}]#{o['chunk_index'] + 1}[/{C_ACCENT}] {o['output']}  "
+            f"[dim]({o['method']}, {o['frame_bytes']:,} B of {o['capacity']:,} B capacity)[/dim]"
+        )
+    console.print(Panel("\n".join(lines), title=f"[{C_TITLE}]StegoForge — Multi-Carrier Encode[/{C_TITLE}]",
+                        border_style="cyan", padding=(1, 2)))
+
+
+def print_decode_multi_result(result: dict):
+    panel_content = (
+        f"[{C_SUCCESS}]✓ {result['chunks']} chunk(s) reassembled in order[/{C_SUCCESS}]\n\n"
+        f"  [dim]Session   :[/dim]  {result['session_id']}\n"
+        f"  [dim]Output    :[/dim]  [{C_SUCCESS}]{result['output']}[/{C_SUCCESS}]\n"
+        f"  [dim]Payload   :[/dim]  {result['payload_size']:,} bytes"
+    )
+    console.print(Panel(panel_content, title=f"[{C_TITLE}]StegoForge — Multi-Carrier Decode[/{C_TITLE}]",
+                        border_style="green", padding=(1, 2)))
+
+
 def print_detect_results(report: dict):
     console.print(Panel(
         f"[{C_ACCENT}]File:[/{C_ACCENT}] {report['file']}\n"
@@ -1837,6 +2085,13 @@ def print_capacity_result(result: dict):
             f"\n\n  [{C_INFO}]JND-safe DCT capacity:[/{C_INFO}]\n"
             f"    {j['bytes']:,} bytes ({j['kb']} KB)\n"
             f"    [dim]{j['note']}[/dim]"
+        )
+    if result.get("chunked_payload_estimate"):
+        c = result["chunked_payload_estimate"]
+        panel_content += (
+            f"\n\n  [{C_INFO}]Usable via encode-multi:[/{C_INFO}]\n"
+            f"    {c['usable_bytes']:,} bytes ({c['usable_kb']} KB)\n"
+            f"    [dim]{c['frame_overhead_bytes']} B frame header + CRC32 already deducted[/dim]"
         )
     if result.get("video_context"):
         v = result["video_context"]
@@ -2525,6 +2780,69 @@ def cmd_decode(
             print(json.dumps(result, indent=2))
         else:
             print_decode_result(result)
+    except (ValueError, IOError) as e:
+        if json_mode:
+            print(json.dumps({"status": "error", "message": str(e)}))
+        else:
+            console.print(f"[{C_ERROR}][ERROR][/{C_ERROR}] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("encode-multi", help="Split a large payload across multiple carriers (chunked, ordered, checksummed)")
+def cmd_encode_multi(
+    carriers:   list[str] = typer.Option(..., "-c", "--carrier", help="Carrier file — repeat for each, used in given order"),
+    payload:    str  = typer.Option(..., "-p", "--payload",   help="Path to payload file"),
+    key:        Optional[str] = typer.Option(None, "-k", "--key", help="Encryption passphrase (optional)"),
+    output_dir: Optional[str] = typer.Option(None, "-o", "--output-dir", help="Directory for stego parts (default: alongside carriers)"),
+    method:     Optional[str] = typer.Option(None, "--method", help="Encoding method (auto-detected per carrier if omitted)"),
+    depth:      int  = typer.Option(1, "--depth", help="Bit depth 1-4 for LSB-based methods"),
+    json_mode:  bool = typer.Option(False, "--json", help="Output JSON instead of formatted text"),
+):
+    """
+    Splits the payload into checksummed chunks and embeds one chunk per carrier.
+    Capacity of every carrier is measured up front — if the payload does not
+    fit, the command fails BEFORE any carrier is modified.
+
+    Examples:
+      stegoforge encode-multi -c a.png -c b.png -c c.png -p big.bin -k secret
+      stegoforge encode-multi -c a.png -c b.png -p big.bin -o ./out/ --depth 2
+    """
+    try:
+        result = op_encode_multi(carriers, payload, key, output_dir, method, depth, json_mode)
+        if json_mode:
+            print(json.dumps(result, indent=2))
+        else:
+            print_encode_multi_result(result)
+    except (ValueError, IOError) as e:
+        if json_mode:
+            print(json.dumps({"status": "error", "message": str(e)}))
+        else:
+            console.print(f"[{C_ERROR}][ERROR][/{C_ERROR}] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("decode-multi", help="Reassemble a payload split across multiple carriers by encode-multi")
+def cmd_decode_multi(
+    files:     list[str] = typer.Option(..., "-f", "--file", help="Stego part file — repeat for each, any order"),
+    key:       Optional[str] = typer.Option(None, "-k", "--key", help="Decryption passphrase (optional)"),
+    output:    Optional[str] = typer.Option(None, "-o", "--output", help="Output path (auto if omitted)"),
+    method:    Optional[str] = typer.Option(None, "--method", help="Encoding method (auto-detected if omitted)"),
+    json_mode: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """
+    Reassembles chunks in their original order using the index embedded in
+    each frame. Fails with an explicit error if chunks are missing,
+    duplicated, from different encode sessions, or truncated/corrupted.
+
+    Example:
+      stegoforge decode-multi -f a_stego_part001of002.png -f b_stego_part002of002.png -k secret
+    """
+    try:
+        result = op_decode_multi(files, key, output, method, json_mode)
+        if json_mode:
+            print(json.dumps(result, indent=2))
+        else:
+            print_decode_multi_result(result)
     except (ValueError, IOError) as e:
         if json_mode:
             print(json.dumps({"status": "error", "message": str(e)}))
